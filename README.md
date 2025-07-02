@@ -49,8 +49,9 @@ CrisisCompass is an intelligent, offline-first crisis response platform that lev
 ├── notebooks/
 │   └── training_notebooks.ipynb
 └── README.md
+```
 
-🧪 Example
+## 🧪 Example
 yaml
 Copy
 Edit
@@ -65,7 +66,7 @@ Input:
 📝 Generated Instruction:
 "Deploy search and rescue teams immediately to Siliguri. Coordinate with local response u
 
-👨‍🔬 Future Work
+## 👨‍🔬 Future Work
 🔊 Auto-call generation via Twilio or Android app
 
 🌍 GPS-based routing to closest responders
@@ -74,8 +75,8 @@ Input:
 
 🧠 Advanced instruction LLM trained with real world + crowdsourced data
 
-👤 Author
+## 👤 Author
 Built with 💡 by Mehhta – always open to contributions or ideas!
 
-📜 License
+## 📜 License
 MIT – use freely, just don’t leave people behind. 🆘
