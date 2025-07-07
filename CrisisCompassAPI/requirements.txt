@@ -1,0 +1,8 @@
+flask
+torch
+transformers
+spacy
+geopy
+python-dotenv
+supabase
+requests

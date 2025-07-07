@@ -1,0 +1,196 @@
+import os
+
+base = "CrisisCompassAPI/api"
+
+# Directory structure
+folders = [
+    base,
+    f"{base}/models",
+    f"{base}/models/crisis_llm_model"
+]
+
+# File contents
+files = {
+    f"{base}/app.py": '''
+from flask import Flask, request, jsonify
+from models.classifier import crisis_pipeline
+
+app = Flask(__name__)
+
+@app.route("/analyze", methods=["POST"])
+def analyze():
+    data = request.get_json()
+    report = data.get("report")
+    if not report:
+        return jsonify({"error": "Missing report"}), 400
+    result = crisis_pipeline(report)
+    return jsonify(result)
+
+if __name__ == "__main__":
+    app.run(debug=True)
+''',
+
+    f"{base}/models/classifier.py": '''
+import os
+import json
+import torch
+import torch.nn as nn
+import spacy
+from geopy.geocoders import Nominatim
+from transformers import AutoTokenizer, AutoModelForCausalLM, DistilBertTokenizer, pipeline
+from transformers import DistilBertModel
+
+# ========== 0. Load Custom Crisis Classifier ==========
+class CrisisClassifier(nn.Module):
+    def __init__(self, num_types=5, num_urgencies=3):
+        super().__init__()
+        self.bert = DistilBertModel.from_pretrained("distilbert-base-uncased")
+        self.dropout = nn.Dropout(0.3)
+        self.type_head = nn.Linear(self.bert.config.hidden_size, num_types)
+        self.urgency_head = nn.Linear(self.bert.config.hidden_size, num_urgencies)
+
+    def forward(self, input_ids, attention_mask):
+        output = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        pooled = self.dropout(output.last_hidden_state[:, 0])
+        return self.type_head(pooled), self.urgency_head(pooled)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+classifier_tokenizer = DistilBertTokenizer.from_pretrained("distilbert-base-uncased")
+classifier_model_path = os.path.join("api", "models", "crisis_model.pt")
+classifier_model = CrisisClassifier()
+classifier_model.load_state_dict(torch.load(classifier_model_path, map_location=device))
+classifier_model.to(device)
+classifier_model.eval()
+
+def classify_crisis(text):
+    inputs = classifier_tokenizer(text, return_tensors="pt", truncation=True, padding=True).to(device)
+    out_type, out_urgency = classifier_model(**inputs)
+    type_idx = torch.argmax(out_type, dim=1).item()
+    urgency_idx = torch.argmax(out_urgency, dim=1).item()
+    type_labels = ["Medical", "Food", "Shelter", "Search & Rescue", "Infrastructure Damage"]
+    urgency_labels = ["Low", "Medium", "High"]
+    return type_labels[type_idx], urgency_labels[urgency_idx]
+
+# ========== 1. Load LLM ==========
+LLM_PATH = os.path.join("api", "models", "crisis_llm_model")
+llm_tokenizer = AutoTokenizer.from_pretrained(LLM_PATH)
+llm_model = AutoModelForCausalLM.from_pretrained(LLM_PATH)
+llm_pipe = pipeline("text-generation", model=llm_model, tokenizer=llm_tokenizer, device=0 if torch.cuda.is_available() else -1)
+
+# ========== 2. Location Extraction ==========
+nlp = spacy.load("en_core_web_sm")
+geolocator = Nominatim(user_agent="crisiscompass")
+
+def extract_location(text):
+    doc = nlp(text)
+    for ent in doc.ents:
+        if ent.label_ in ["GPE", "LOC"]:
+            return ent.text
+    return "Unknown"
+
+# ========== 3. Geocoding ==========
+def geocode_location(location):
+    try:
+        loc = geolocator.geocode(location, addressdetails=True, country_codes='in')
+        if loc:
+            lat = loc.latitude
+            lon = loc.longitude
+            full_address = loc.address
+            address_dict = loc.raw.get("address", {})
+            state = address_dict.get("state") or address_dict.get("region") or "Unknown"
+            return lat, lon, full_address, state
+    except Exception as e:
+        print("GeoError:", e)
+    return None, None, "", "Unknown"
+
+# ========== 4. Contact Mapping ==========
+contact_path = os.path.join("api", "models", "emergency_contacts.json")
+with open(contact_path, "r", encoding="utf-8") as f:
+    contact_dict = json.load(f)
+
+def get_contact(state):
+    return contact_dict.get(state, "Not Available")
+
+# ========== 5. Instruction Generation ==========
+def generate_instruction(crisis_type, urgency, location, contact):
+    prompt = f"<s>[INST] Crisis Type: {crisis_type}, Urgency: {urgency}, Location: {location}, Contact: {contact} [/INST]"
+    result = llm_pipe(prompt, max_new_tokens=100, do_sample=True, temperature=0.7)
+    return result[0]["generated_text"].split("[/INST]")[-1].strip()
+
+# ========== 6. Logic Layer ==========
+recent_disasters = [
+    {"type": "Flood", "state": "Assam"},
+    {"type": "Flood", "state": "Meghalaya"},
+    {"type": "Flood", "state": "Mizoram"},
+    {"type": "Landslide", "state": "Uttarakhand"},
+    {"type": "Cloudburst", "state": "Uttarakhand"},
+    {"type": "Flash Flood", "state": "Himachal Pradesh"},
+    {"type": "Flood", "state": "Arunachal Pradesh"},
+    {"type": "Flash Flood", "state": "Jammu & Kashmir"},
+    {"type": "Avalanche", "state": "Uttarakhand"},
+]
+
+def dynamic_logic_warning(crisis_type, state):
+    if crisis_type.lower() == "search & rescue":
+        return None
+    type_map = {
+        "Flood": ["flood", "flash flood"],
+        "Landslide": ["landslide", "cloudburst"],
+        "Avalanche": ["avalanche"],
+    }
+    c = crisis_type.lower()
+    s = state.lower()
+    for rec in recent_disasters:
+        if s == rec["state"].lower():
+            for match in type_map.get(crisis_type, [c]):
+                if match.lower() in rec["type"].lower():
+                    return None
+    if crisis_type in type_map:
+        return f"⚠️ {crisis_type} is uncommon in {state}. Please verify."
+    return None
+
+# ========== 7. Final Pipeline ==========
+def crisis_pipeline(report_text):
+    crisis_type, urgency = classify_crisis(report_text)
+    location = extract_location(report_text)
+    lat, lon, full_address, state = geocode_location(location)
+    contact = get_contact(state)
+    instruction = generate_instruction(crisis_type, urgency, location, contact)
+    logic_warning = dynamic_logic_warning(crisis_type, state)
+
+    return {
+        "crisis_type": crisis_type,
+        "urgency": urgency,
+        "location": location,
+        "state": state,
+        "latitude": lat,
+        "longitude": lon,
+        "contact": contact,
+        "instruction": instruction,
+        "logic_warning": logic_warning
+    }
+'''
+}
+
+# Create folders
+for folder in folders:
+    os.makedirs(folder, exist_ok=True)
+
+# Create files with content
+for filepath, content in files.items():
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(content.strip())
+
+# Create empty placeholders
+open(f"{base}/models/emergency_contacts.json", "w").write("{}")
+open(f"{base}/models/crisis_model.pt", "wb").write(b"")  # dummy binary
+
+print("\n✅ Structure created. Now place your files here:\n")
+print("📂 CrisisCompassAPI/")
+print(" └── api/")
+print("     ├── app.py")
+print("     └── models/")
+print("         ├── classifier.py")
+print("         ├── crisis_model.pt          ← Paste your trained classifier model here")
+print("         ├── emergency_contacts.json  ← Add your state-contact map here")
+print("         └── crisis_llm_model/        ← Paste your LLM model folder here")
